@@ -1,0 +1,145 @@
+import cv2
+import numpy as np
+import sqlite3
+import os
+from flask import Flask, request
+import ast
+
+app = Flask(__name__)
+
+#possibly remove histographic EQ for better results
+
+def preprocess_image(image):
+    
+    b, g, r = cv2.split(image)
+    b = np.minimum(b, 111)
+    g = np.minimum(g, 111)
+    r = np.minimum(r, 111)
+    b_eq = cv2.equalizeHist(b)
+    g_eq = cv2.equalizeHist(g)
+    r_eq = cv2.equalizeHist(r)
+    image = cv2.merge((b_eq, g_eq, r_eq))
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest_contour = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(largest_contour, True)
+    approx = cv2.approxPolyDP(largest_contour, 0.02 * peri, True)
+    corners = np.squeeze(approx)
+    corners = order_corners(corners)
+    target_shape = np.array([[0, 0], [511, 0], [511, 511], [0, 511]], dtype=np.float32)
+    matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), target_shape)
+    transformed_image = cv2.warpPerspective(image, matrix, (512, 512))
+    return transformed_image
+
+def order_corners(corners):
+    sorted_corners = np.zeros((4, 2), dtype=np.float32)
+    sums = corners.sum(axis=1)
+    diffs = np.diff(corners, axis=1)
+    sorted_corners[0] = corners[np.argmin(sums)]
+    sorted_corners[2] = corners[np.argmax(sums)]
+    sorted_corners[1] = corners[np.argmin(diffs)]
+    sorted_corners[3] = corners[np.argmax(diffs)]
+    return sorted_corners
+
+def calculate_similarity(images, new_image):
+    similarities = []
+    for i, image in enumerate(images):
+        similarity = cosine_similarity(image, new_image)
+        similarities.append(similarity)
+    return np.array(similarities)
+
+def cosine_similarity(image1, image2):
+    image1_flat = image1.flatten() / np.max(image1)
+    image2_flat = image2.flatten() / np.max(image2)
+    dot_product = np.dot(image1_flat, image2_flat)
+    norm_image1 = np.linalg.norm(image1_flat)
+    norm_image2 = np.linalg.norm(image2_flat)
+    similarity = dot_product / (norm_image1 * norm_image2)
+    return similarity
+
+def wave_sequence_cohesion(weights, similarity_scores):
+    for i in range(len(similarity_scores)):
+        if abs(similarity_scores[i] - weights[i]) >= 0.02:
+            break
+    else:
+        return True
+    return False
+
+@app.route('/ARCHIVE', methods=['POST'])
+def archive():
+    if 'image' not in request.files:
+        return 'No image file uploaded', 400
+
+    image_file = request.files['image']
+    image = cv2.imdecode(np.frombuffer(image_file.read(), np.uint8), cv2.IMREAD_COLOR)
+    processed_image = preprocess_image(image)
+
+    link = request.form.get('link')
+    print('Link:', link)
+
+    base_image_folder = r"C:\FRAME\base images"
+    base_image_paths = [os.path.join(base_image_folder, f"image ({i}).jpg") for i in range(30)]
+
+    base_images = [preprocess_image(cv2.imread(image_path)) for image_path in base_image_paths]
+
+    database_file = "image_database.db"
+    conn = sqlite3.connect(database_file)
+    cursor = conn.cursor()
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS images
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     link TEXT NOT NULL,
+                     weights TEXT NULL)''')
+
+    cursor.execute("INSERT INTO images (link, weights) VALUES (?, ?)", (link, None))
+    conn.commit()
+
+    new_image = np.array([processed_image])
+    similarity_scores = calculate_similarity(base_images, processed_image)
+    cursor.execute("UPDATE images SET weights = ? WHERE link = ?", (str(list(similarity_scores)), link))
+    conn.commit()
+
+    conn.close()
+    return "Image archived successfully"
+
+@app.route('/FRAME', methods=['POST'])
+def frame():
+    if 'image' not in request.files:
+        return 'No image file uploaded', 400
+
+    image_file = request.files['image']
+    image = cv2.imdecode(np.frombuffer(image_file.read(), np.uint8), cv2.IMREAD_COLOR)
+    processed_image = preprocess_image(image)
+
+    base_image_folder = r"C:\FRAME\base images"
+    base_image_paths = [os.path.join(base_image_folder, f"image ({i}).jpg") for i in range(30)]
+
+    base_images = [preprocess_image(cv2.imread(image_path)) for image_path in base_image_paths]
+
+    database_file = "image_database.db"
+    conn = sqlite3.connect(database_file)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT link, weights FROM images")
+    rows = cursor.fetchall()
+
+    similarity_scores = calculate_similarity(base_images, processed_image)
+    found_links = []
+    for row in rows:
+        link, weights = row
+        if weights is not None:
+            weights = ast.literal_eval(weights)
+            if wave_sequence_cohesion(weights, similarity_scores):
+                print("Link:", link)
+                found_links.append(link)
+
+    conn.close()
+
+    if found_links:
+        return ", ".join(found_links)
+    else:
+        return "Image processed successfully. No matching links found."
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000)
